@@ -1,0 +1,649 @@
+name: Cloud Server Controller
+on:
+  workflow_dispatch:
+    inputs:
+      server_count:
+        description: 'Number of servers to deploy'
+        required: false
+        default: '3'
+      server_type:
+        description: 'Server type (windows/linux/mixed)'
+        required: false
+        default: 'mixed'
+  schedule:
+    - cron: '0 */5 * * *'
+    - cron: '15 */5 * * *'
+  push:
+    branches: [main, cloud-servers]
+
+jobs:
+  deploy-infrastructure:
+    runs-on: ubuntu-latest
+    outputs:
+      deployment_id: ${{ steps.setup.outputs.deployment_id }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        
+      - name: Setup Cloud Infrastructure
+        id: setup
+        run: |
+          DEPLOYMENT_ID="cloud-$(date +%Y%m%d%H%M%S)"
+          echo "deployment_id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+          
+          # Create infrastructure config
+          mkdir -p cloud-config
+          cat > cloud-config/infrastructure.json <<EOF
+          {
+            "deployment_id": "$DEPLOYMENT_ID",
+            "timestamp": "$(date -Iseconds)",
+            "servers": {
+              "windows": {
+                "count": 1,
+                "type": "windows-latest",
+                "services": ["rdp", "web", "database", "storage"]
+              },
+              "linux": {
+                "count": 2,
+                "type": "ubuntu-latest",
+                "services": ["web", "database", "storage", "dns", "vpn", "monitoring"]
+              }
+            },
+            "network": {
+              "vpn": "tailscale",
+              "dns": "pihole",
+              "proxy": "nginx"
+            }
+          }
+          EOF
+          
+          git config --global user.name "Cloud Controller"
+          git config --global user.email "cloud@localhost"
+          git add cloud-config/
+          git commit -m "Cloud deployment $DEPLOYMENT_ID"
+          git push
+
+  windows-server:
+    needs: deploy-infrastructure
+    runs-on: windows-latest
+    timeout-minutes: 350
+    concurrency:
+      group: cloud-windows-${{ github.run_id }}
+      cancel-in-progress: false
+    
+    steps:
+      - name: 📥 Restore Cloud State
+        uses: actions/checkout@v3
+        
+      - name: 🏗️ Build Windows Cloud Server
+        shell: powershell
+        run: |
+          # Set timezone
+          tzutil /s "Eastern Standard Time"
+          
+          # Create cloud directory structure
+          $cloudDirs = @(
+            "C:\Cloud",
+            "C:\Cloud\Data",
+            "C:\Cloud\WebServer",
+            "C:\Cloud\Database",
+            "C:\Cloud\Storage",
+            "C:\Cloud\Backups",
+            "C:\Cloud\Logs",
+            "C:\Cloud\Config"
+          )
+          
+          foreach ($dir in $cloudDirs) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          }
+          
+          Write-Host "Windows Cloud Server structure created"
+
+      - name: 🖥️ Configure Windows Services
+        shell: powershell
+        run: |
+          # Enable all required services
+          $services = @(
+            "TermService",     # RDP
+            "W3SVC",          # IIS
+            "MSSQLSERVER",    # SQL Server (if available)
+            "WinRM",          # Remote Management
+            "Schedule"        # Task Scheduler
+          )
+          
+          foreach ($svc in $services) {
+            try {
+              Set-Service $svc -StartupType Automatic -ErrorAction SilentlyContinue
+              Start-Service $svc -ErrorAction SilentlyContinue
+              Write-Host "✓ $svc configured"
+            } catch {
+              Write-Host "⚠ $svc not available"
+            }
+          }
+          
+          # Configure IIS Web Server
+          Enable-WindowsOptionalFeature -Online -FeatureName IIS-WebServerRole -NoRestart
+          Enable-WindowsOptionalFeature -Online -FeatureName IIS-WebServer -NoRestart
+          Enable-WindowsOptionalFeature -Online -FeatureName IIS-ApplicationDevelopment -NoRestart
+          
+          # Create default website
+          $webContent = @"
+          <html>
+          <head><title>Self-Hosted Cloud Server</title></head>
+          <body>
+          <h1>Welcome to Your Self-Hosted Cloud</h1>
+          <p>Server: Windows</p>
+          <p>Status: Online 24/7</p>
+          <p>Services: Web, Storage, Database, RDP</p>
+          </body>
+          </html>
+"@
+          $webContent | Out-File -FilePath "C:\inetpub\wwwroot\index.html" -Encoding UTF8
+
+      - name: 👤 Create Cloud Admin User
+        shell: powershell
+        run: |
+          # Generate secure credentials
+          Add-Type -AssemblyName System.Web
+          $adminPass = [System.Web.Security.Membership]::GeneratePassword(32, 8)
+          $securePass = ConvertTo-SecureString $adminPass -AsPlainText -Force
+          
+          # Remove existing admin
+          Remove-LocalUser -Name "CloudAdmin" -ErrorAction SilentlyContinue
+          
+          # Create cloud administrator
+          New-LocalUser -Name "CloudAdmin" `
+                       -Password $securePass `
+                       -PasswordNeverExpires `
+                       -AccountNeverExpires `
+                       -FullName "Cloud Administrator"
+          
+          # Add to admin groups
+          Add-LocalGroupMember -Group "Administrators" -Member "CloudAdmin"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CloudAdmin"
+          
+          # Save credentials
+          @"
+          Windows Cloud Server Credentials
+          ================================
+          Username: CloudAdmin
+          Password: $adminPass
+          Port: 3389
+          Server Type: Windows Cloud Server
+          "@ | Out-File -FilePath "C:\Cloud\Config\credentials.txt" -Encoding UTF8
+          
+          echo "WINDOWS_USER=CloudAdmin" >> $env:GITHUB_ENV
+          echo "WINDOWS_PASS=$adminPass" >> $env:GITHUB_ENV
+
+      - name: 🔐 Setup Windows Security
+        shell: powershell
+        run: |
+          # Configure Windows Firewall
+          $ports = @(3389, 80, 443, 8080, 8443, 3306, 5432, 1433, 27017)
+          
+          foreach ($port in $ports) {
+            New-NetFirewallRule -DisplayName "Cloud-Port-$port" `
+                               -Direction Inbound `
+                               -Protocol TCP `
+                               -LocalPort $port `
+                               -Action Allow `
+                               -ErrorAction SilentlyContinue
+          }
+          
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          
+          Write-Host "Security configured for cloud services"
+
+      - name: 📦 Install Cloud Applications
+        shell: powershell
+        run: |
+          # Install Chocolatey package manager
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          
+          # Install cloud applications
+          $packages = @(
+            "git",
+            "nginx",
+            "nodejs",
+            "python",
+            "vscode",
+            "docker-desktop",
+            "postgresql",
+            "mongodb",
+            "redis",
+            "filezilla-server",
+            "nextcloud",
+            "7zip",
+            "wget",
+            "curl"
+          )
+          
+          foreach ($pkg in $packages) {
+            try {
+              Write-Host "Installing $pkg..."
+              choco install $pkg -y --no-progress
+              Write-Host "✓ $pkg installed"
+            } catch {
+              Write-Host "⚠ Failed to install $pkg"
+            }
+          }
+
+      - name: 🔗 Connect to Cloud Network
+        shell: powershell
+        run: |
+          # Install Tailscale for cloud networking
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
+          Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
+          
+          Start-Sleep -Seconds 10
+          
+          # Connect to Tailscale network
+          $tsExe = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="cloud-windows-$($env:GITHUB_RUN_ID)"
+          
+          # Get IP
+          $tsIP = $null
+          for($i=1; $i -le 15; $i++) {
+            Start-Sleep -Seconds 5
+            $tsIP = & $tsExe ip -4 2>$null
+            if($tsIP) { break }
+          }
+          
+          echo "WINDOWS_IP=$tsIP" >> $env:GITHUB_ENV
+          $tsIP | Out-File -FilePath "C:\Cloud\Config\ip_address.txt"
+
+      - name: 🗄️ Setup Cloud Storage System
+        shell: powershell
+        run: |
+          # Create network shares
+          $shares = @(
+            @{Name="CloudData"; Path="C:\Cloud\Data"},
+            @{Name="CloudBackup"; Path="C:\Cloud\Backups"},
+            @{Name="CloudWeb"; Path="C:\Cloud\WebServer"}
+          )
+          
+          foreach ($share in $shares) {
+            New-SmbShare -Name $share.Name -Path $share.Path -FullAccess "CloudAdmin" -ErrorAction SilentlyContinue
+            Write-Host "✓ Share created: $($share.Name)"
+          }
+          
+          # Setup Nextcloud storage
+          New-Item -ItemType Directory -Path "C:\Cloud\Nextcloud" -Force
+          
+          Write-Host "Cloud storage system ready"
+
+      - name: 📊 Start Cloud Dashboard
+        shell: powershell
+        run: |
+          # Create cloud status dashboard
+          $dashboard = @"
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Cloud Server Dashboard</title>
+              <style>
+                  body { font-family: Arial; background: #1a1a2e; color: #eee; padding: 20px; }
+                  .status { background: #16213e; padding: 20px; border-radius: 10px; margin: 10px 0; }
+                  .online { color: #00ff00; }
+                  .server { border-left: 4px solid #0f3460; padding: 10px; margin: 10px 0; }
+              </style>
+          </head>
+          <body>
+              <h1>🖥️ Self-Hosted Cloud Dashboard</h1>
+              <div class="status">
+                  <h2>Windows Server <span class="online">● Online</span></h2>
+                  <div class="server">
+                      <p>IP: $env:WINDOWS_IP</p>
+                      <p>CPU: Windows Server Core</p>
+                      <p>Memory: 7GB</p>
+                      <p>Storage: 14GB SSD</p>
+                      <p>Uptime: 24/7</p>
+                  </div>
+                  <h3>Running Services:</h3>
+                  <ul>
+                      <li>🌐 Web Server (IIS/Nginx)</li>
+                      <li>💾 File Storage (SMB/Nextcloud)</li>
+                      <li>🗄️ Database Server</li>
+                      <li>🖥️ Remote Desktop</li>
+                      <li>🔒 VPN (Tailscale)</li>
+                  </ul>
+              </div>
+          </body>
+          </html>
+"@
+          $dashboard | Out-File -FilePath "C:\Cloud\WebServer\dashboard.html" -Encoding UTF8
+          
+          # Start web server for dashboard
+          Start-Process -NoNewWindow -FilePath "C:\Cloud\WebServer\dashboard.html"
+          
+          Write-Host "Cloud Dashboard started"
+
+      - name: 🚀 Maintain Cloud Operation
+        shell: powershell
+        run: |
+          $startTime = Get-Date
+          $maxMinutes = 340
+          
+          # Cloud health monitoring
+          while ($true) {
+            $elapsed = ((Get-Date) - $startTime).TotalMinutes
+            $remaining = $maxMinutes - $elapsed
+            
+            # Update cloud status
+            @"
+          Cloud Status:
+          Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+          Server: Windows
+          Status: Online
+          Uptime: $([math]::Round($elapsed, 1)) minutes
+          Services: All Running
+          "@ | Out-File -FilePath "C:\Cloud\Logs\status.txt" -Force
+            
+            # Check and restart critical services
+            $criticalServices = @("TermService", "W3SVC")
+            foreach ($svc in $criticalServices) {
+              $status = Get-Service $svc -ErrorAction SilentlyContinue
+              if ($status.Status -ne 'Running') {
+                Start-Service $svc
+              }
+            }
+            
+            # Backup cloud data
+            if ([math]::Round($elapsed) % 30 -eq 0) {
+              Compress-Archive -Path "C:\Cloud\*" -DestinationPath "C:\Cloud\Backups\cloud-backup.zip" -Force
+              Write-Host "Cloud backup completed"
+            }
+            
+            # Check approaching timeout
+            if ($remaining -le 5) {
+              Write-Host "Auto-restarting cloud server..."
+              break
+            }
+            
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Cloud Server Active | Uptime: $([math]::Round($elapsed))m | Remaining: $([math]::Round($remaining))m" -NoNewline
+            Start-Sleep -Seconds 60
+          }
+
+  linux-server:
+    needs: deploy-infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    concurrency:
+      group: cloud-linux-${{ github.run_id }}
+      cancel-in-progress: false
+    
+    steps:
+      - name: 📥 Restore Cloud State
+        uses: actions/checkout@v3
+        
+      - name: 🐧 Build Linux Cloud Server
+        run: |
+          # Set timezone
+          sudo timedatectl set-timezone America/New_York
+          
+          # Create cloud directories
+          sudo mkdir -p /opt/cloud/{data,web,db,storage,backups,logs,config}
+          
+          echo "Linux Cloud Server structure created"
+
+      - name: 🔧 Install Linux Cloud Services
+        run: |
+          # Update system
+          sudo apt-get update -y
+          sudo apt-get upgrade -y
+          
+          # Install core services
+          sudo apt-get install -y \
+            nginx \
+            postgresql \
+            redis-server \
+            docker.io \
+            docker-compose \
+            nextcloud-desktop \
+            samba \
+            vsftpd \
+            openssh-server \
+            fail2ban \
+            ufw \
+            htop \
+            netdata \
+            git \
+            curl \
+            wget \
+            vim \
+            tmux \
+            screen \
+            supervisor \
+            nodejs \
+            npm \
+            python3 \
+            python3-pip
+          
+          echo "Core services installed"
+
+      - name: 🗄️ Configure Database Server
+        run: |
+          # Start PostgreSQL
+          sudo systemctl start postgresql
+          sudo systemctl enable postgresql
+          
+          # Create cloud database
+          sudo -u postgres psql -c "CREATE USER cloudadmin WITH PASSWORD 'cloud123';"
+          sudo -u postgres psql -c "CREATE DATABASE cloud OWNER cloudadmin;"
+          
+          # Configure Redis
+          sudo systemctl start redis-server
+          sudo systemctl enable redis-server
+          
+          echo "Database servers configured"
+
+      - name: 🌐 Setup Web Server & Cloud Apps
+        run: |
+          # Configure Nginx
+          sudo tee /etc/nginx/sites-available/cloud <<EOF
+          server {
+              listen 80;
+              server_name _;
+              
+              location / {
+                  root /opt/cloud/web;
+                  index index.html;
+              }
+              
+              location /api {
+                  proxy_pass http://localhost:3000;
+              }
+              
+              location /storage {
+                  alias /opt/cloud/storage;
+              }
+          }
+          EOF
+          
+          sudo ln -s /etc/nginx/sites-available/cloud /etc/nginx/sites-enabled/
+          sudo rm /etc/nginx/sites-enabled/default
+          sudo nginx -t && sudo systemctl restart nginx
+          
+          # Create web dashboard
+          cat > /opt/cloud/web/index.html <<EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Cloud Server - Linux</title>
+              <style>
+                  body { font-family: Arial; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; }
+                  .container { max-width: 800px; margin: 0 auto; }
+                  .card { background: rgba(255,255,255,0.1); padding: 20px; border-radius: 10px; margin: 10px 0; }
+                  .status { color: #00ff00; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1>🐧 Linux Cloud Server</h1>
+                  <div class="card">
+                      <h2>Status: <span class="status">Online</span></h2>
+                      <p>Services: Web, Database, Storage, VPN</p>
+                      <p>Uptime: 24/7</p>
+                  </div>
+              </div>
+          </body>
+          </html>
+          EOF
+          
+          echo "Web server configured"
+
+      - name: 💾 Setup File Storage
+        run: |
+          # Configure Samba for file sharing
+          sudo tee -a /etc/samba/smb.conf <<EOF
+          [CloudData]
+          path = /opt/cloud/data
+          browseable = yes
+          read only = no
+          guest ok = yes
+          
+          [CloudBackup]
+          path = /opt/cloud/backups
+          browseable = yes
+          read only = no
+          guest ok = yes
+          EOF
+          
+          sudo systemctl restart smbd
+          
+          # Setup Nextcloud
+          sudo docker run -d \
+            --name nextcloud \
+            -p 8080:80 \
+            -v /opt/cloud/data:/var/www/html/data \
+            nextcloud
+          
+          echo "Storage services configured"
+
+      - name: 🔐 Setup Security & Monitoring
+        run: |
+          # Configure firewall
+          sudo ufw allow 22/tcp
+          sudo ufw allow 80/tcp
+          sudo ufw allow 443/tcp
+          sudo ufw allow 8080/tcp
+          sudo ufw allow 3389/tcp
+          sudo ufw --force enable
+          
+          # Setup Fail2ban
+          sudo systemctl start fail2ban
+          sudo systemctl enable fail2ban
+          
+          # Setup Netdata monitoring
+          sudo systemctl start netdata
+          sudo systemctl enable netdata
+          
+          echo "Security configured"
+
+      - name: 🔗 Connect to Cloud Network
+        run: |
+          # Install Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          # Connect to Tailscale
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="cloud-linux-$GITHUB_RUN_ID"
+          
+          # Get IP
+          TAILSCALE_IP=$(tailscale ip -4)
+          echo "LINUX_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          
+          echo "Linux Cloud IP: $TAILSCALE_IP"
+
+      - name: 🐳 Deploy Docker Containers
+        run: |
+          # Create docker-compose for cloud services
+          cat > /opt/cloud/docker-compose.yml <<EOF
+          version: '3.8'
+          
+          services:
+            portainer:
+              image: portainer/portainer-ce
+              ports:
+                - "9443:9443"
+              volumes:
+                - /var/run/docker.sock:/var/run/docker.sock
+                - portainer_data:/data
+              restart: always
+          
+            cloudcmd:
+              image: coderaiser/cloudcmd
+              ports:
+                - "8000:8000"
+              volumes:
+                - /opt/cloud:/root
+              restart: always
+          
+            code-server:
+              image: codercom/code-server
+              ports:
+                - "8443:8080"
+              volumes:
+                - /opt/cloud:/home/coder/project
+              environment:
+                - PASSWORD=cloud123
+              restart: always
+          
+          volumes:
+            portainer_data:
+          EOF
+          
+          # Start containers
+          cd /opt/cloud && sudo docker-compose up -d
+          
+          echo "Docker services deployed"
+
+      - name: 📊 Display Cloud Info
+        run: |
+          echo "╔════════════════════════════════════════════════════════════════╗"
+          echo "║            LINUX CLOUD SERVER - ONLINE                         ║"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          echo "║  IP Address: $LINUX_IP                                        ║"
+          echo "║  SSH: ssh cloudadmin@$LINUX_IP                                 ║"
+          echo "║  Web Dashboard: http://$LINUX_IP                              ║"
+          echo "║  Portainer: https://$LINUX_IP:9443                           ║"
+          echo "║  Code Server: http://$LINUX_IP:8443                          ║"
+          echo "║  Cloud CMD: http://$LINUX_IP:8000                            ║"
+          echo "║  Nextcloud: http://$LINUX_IP:8080                            ║"
+          echo "╚════════════════════════════════════════════════════════════════╝"
+
+      - name: 🔄 Maintain Linux Cloud
+        run: |
+          START_TIME=$(date +%s)
+          MAX_SECONDS=20400  # 340 minutes
+          
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            REMAINING=$((MAX_SECONDS - ELAPSED))
+            
+            # Health checks
+            services=("nginx" "postgresql" "redis-server" "docker" "tailscaled")
+            for svc in "${services[@]}"; do
+              if ! systemctl is-active --quiet $svc; then
+                sudo systemctl restart $svc
+                echo "Restarted $svc"
+              fi
+            done
+            
+            # Backup every 30 minutes
+            if [ $((ELAPSED % 1800)) -eq 0 ]; then
+              sudo tar -czf /opt/cloud/backups/cloud-backup-$(date +%Y%m%d%H%M%S).tar.gz /opt/cloud/
+              echo "Backup completed"
+            fi
+            
+            if [ $REMAINING -le 300 ]; then
+              echo "Preparing for restart..."
+              break
+            fi
+            
+            echo "[$(date +%H:%M:%S)] Linux Cloud Active | Uptime: $((ELAPSED/60))m | Remaining: $((REMAINING/60))m"
+            sleep 60
+          done
